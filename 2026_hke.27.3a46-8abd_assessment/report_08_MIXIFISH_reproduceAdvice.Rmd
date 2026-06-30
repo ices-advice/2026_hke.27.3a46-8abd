@@ -1,0 +1,391 @@
+---
+title: "Reproducing the advice for hke.27.3a46-8abd"
+header-includes:
+- \usepackage{pdflscape}
+- \newcommand{\blandscape}{\begin{landscape}}
+- \newcommand{\elandscape}{\end{landscape}}
+- \usepackage[singlelinecheck=false]{caption}
+output:
+  # rmarkdown::html_vignette:
+  html_document:
+    number_sections: TRUE
+    df_print: paged
+    toc: true
+    toc_depth: 3
+    toc_float:
+      collapsed: true
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(
+  cache = FALSE, # TRUE for speed. Remember to empty cache after changes to cached R code sections
+  cache.path = "cache/", fig.path = "tex/",
+  echo = TRUE, 
+  collapse = TRUE,
+  comment = "#>",
+  fig.width = 6, fig.height = 5, dpi=300, 
+  out.width="600px", out.height="500px"
+)
+```
+
+```{r packages, message=FALSE, warning=FALSE, include = FALSE}
+library(FLCore)
+library(FLasher)
+library(mixfishtools)
+library(tidyr)
+library(ggplot2)
+library(ggplotFL)
+library(knitr)
+```
+
+# Introduction
+
+Reproducing the single stock advice (SSA) is a quality control step done by each WGMIXFISH case study before proceeding with mixed fishery modelling scenarios. Mixed fishery modelling is conducted with a different operating model than the SSA (e.g. FCube and FLBEIA), which is deterministic, and thus will deviate from the stochastic forecasts used by many assessment forecasts. 
+
+Currently, assessors are asked to provide assessment summaries in the form of FLStock objects. These provide a starting point for mixed fishery forecasts, but we also use them in a preliminary step to see if we are able to approximate the SSA using a deterministic forecast in FLR. In order to do this, we try and reproduce the headline advice assumptions in forecast years. This includes assumptions used for the intermediate year (e.g. status quo F, TAC uptake) and advice year fishing targets (e.g. Fmsy). Additionally, assumptions for future biological parameters must also be considered (e.g. mean weights, maturity, recruitment).
+
+During this process, we hope to identify and understand any deviations from SSA that might exist. In the past, deviations have been attributable to both simple reporting errors, as well as inconsistencies between specified assumptions and those of the forecast.
+
+The aim of this document is to demonstrate the procedure employed by WGMIXFISH so that assessors can help catch issues at an earlier stage in the advice calendar year, potentially reducing the frequency of re-openings. 
+
+In the past, assessors have been asked to deliver two FLStock objects to WGMIXFISH: 1. containing input data, and 2. containing all assessment estimated data. To improve consistency between SSA and WGMIXFISH forecasts, we would now ask that the FLStock containing estimated data also include the forecast years. This will ensure even greater consistency in the mixed fishery forecasts regarding biological parameter assumptions and allow for further quality control checks. 
+
+The following section outlines the basic procedure in setting up an FLR-based deterministic forecast. After that, an additional section highlights typical problems encountered, as relating to misspecified forecast assumptions. Finally, a specialized approach is presented for Nephrops, whose advice is based on harvest rates and fixed stock dynamics.
+
+
+# The procedure
+
+1. Start with `FLStock` object with all assessment-estimated values in historical years
+2. Extend FLStock into the short-term forecast years using `FLasher::stf` and, if necessary, manually adjust forecast year slot values to match assessment as closely as possible
+3. Create `FLasher::fwdControl` object to define the targets and limits of the short-term forecast years
+4. Run deterministic forecast with `FLasher::fwd`
+5. Compare resulting stock parameters with those reported by the assessment 
+
+
+## The FLStock with assessment summary
+
+- Contains all assessment estimated values, so that resulting forecast can be reproduced. May differ from the input data in many slots. Here only, catch has been re-estimated to allow for observation error.
+
+```{r FLStockCreation}
+dtyr <- 2025 #! to update
+
+# load FLStock
+load(file.path("WGMIXFISH", "output", paste0("wgbie",dtyr+1,"_nhke_FLStock_cobs.RData"))) # hke.stk.obscwt
+load(file.path("WGMIXFISH", "output", paste0("wgbie",dtyr+1,"_nhke_FLStock_csim.RData"))) # hke.stk, hke.sr
+
+stkInp <- hke.stk.obscwt
+stkEst <- hke.stk
+
+L <- FLStocks(list(input = stkInp, estimated = stkEst))
+plot(L) + 
+  aes(linetype = stock) +
+  scale_color_manual(values = c(8,1)) + 
+  scale_linetype_manual(values = c(1,2)) +
+  theme_bw()
+
+```
+
+## Extend FLStock for short-term forecast
+
+- extend 3 years (intermediate, advice, and advice +1 years)
+- `FLasher::stf` contains several default arguments for defining the number of historical (i.e. terminal) years to average for future values (e.g. mean weights, selection pattern, discard rates). Note that the `wts.nyears` argument defines the averaging period for all biological slots (`catch.wt`, `landings.wt`, `discards.wt`, `stock.wt`, `mat`, `m`, `harvest.spwn`, `m.spwn`).
+- If needed, manually adjust slots to reflect the assumptions of the forecast.
+
+
+```{r FLStockExtention}
+yrAssess <- dtyr   # final year of assessment data
+yrNow    <- dtyr+1 # intermediate year
+yrTAC    <- dtyr+2 # advice year
+yrTACp1  <- dtyr+3 # advice year +1 (needed to get SSB at end of yrTAC)
+
+stkProj <- stf(object = stkEst, nyears = 3, wts.nyears = 3, 
+  fbar.nyears = 3, f.rescale = TRUE, disc.nyears = 3)
+
+df <- as.data.frame(stkProj)
+df <- subset(df, slot %in% c("landings.wt", "discards.wt", "catch.wt", "m", "mat", "harvest") & year > (yrAssess-20))
+df$forecast <- df$year %in% c(yrNow, yrTAC, yrTACp1)
+
+ggplot(df) + aes(x = year, y = data, group = age, color = forecast) +
+  facet_wrap(~slot, scales = "free_y") +
+  geom_line(show.legend = F) + 
+  scale_color_manual(values = c(8,1)) + 
+  theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5)) + 
+  theme_bw()
+
+```
+
+
+## Define forecast control
+
+- Set up `fwdControl` to define the targets and limits of the short-term forecast (years)e.g. intermediate year assumptions, target F, etc.)
+- Set up stock-recruitment model, which will simply hold the recruitment values used by the forecast. These are typically the reported geometric mean in the advice sheet. 
+
+```{r stfControl}
+# stf control (Fsq, followed by 2 years at Fmsy)
+Fmsy <- 0.243 #! to update
+ctrl <- fwdControl( 
+  data.frame(
+    year = c(yrNow, yrTAC, yrTACp1),
+    value = c(1, Fmsy, Fmsy),
+    quant = c("f"),
+    relYear = c(yrAssess, NA, NA)                               
+  )
+)
+
+# stock-recruitment model (manual input - generated by SRR inside Stock Synthesis)
+srPar <- FLPar(c(813000, 817048, 821889), 
+  dimnames = list(params="a", year = c(yrNow, yrTAC, yrTACp1), iter = 1))
+srMod <- FLSR(model = "geomean", params = srPar)
+```
+
+## Run deterministic forecast with FLasher
+
+```{r forecast}
+# projection
+stkProj <- fwd(object = stkProj, control = ctrl, sr = srMod)
+
+# plot
+L <- FLStocks(list(assessment = stkEst, forecast = stkProj[,ac(yrAssess:yrTACp1)]))
+plot(L) + 
+  # aes(linetype = stock) +
+  scale_color_manual(values = c(8,1)) + 
+  # scale_linetype_manual(values = c(2,1)) +
+  theme_bw()
+```
+
+If the intermediate assumption if a catch target, the control object can be adapted in the following way.
+
+```{r forecastCatchTarg}
+TACNow <- 46824 #! to update (but should be Fsq)
+# Fmsy <- 0.243
+
+ctrlAlt <- fwdControl(
+  data.frame(
+    year = c(yrNow, yrTAC, yrTACp1),
+    value = c(TACNow, Fmsy, Fmsy),
+    quant = c("catch", "f", "f")
+  )
+)
+
+stkProjAlt <- fwd(object = stkProj, control = ctrlAlt, sr = srMod)
+
+df <- data.frame(year = yrAssess:yrTACp1, 
+  catch = c(catch(stkProjAlt)[, ac(yrAssess:yrTACp1)]),
+  fbar = c(fbar(stkProjAlt)[, ac(yrAssess:yrTACp1)])
+)
+
+kable(df, digits = 3)
+
+```
+
+
+## Compare summary statistics
+
+```{r compare}
+# Reported output from single stock headline advice
+#! to update (from Advice Sheet)
+stfRef <- data.frame(
+  model = "WGBIE",
+  year = dtyr + 0:3,
+  catch = c(48055+3781, 45367, 46824, NA),
+  landings = c(48055, 41862, 43255, NA),
+  fbar = c(0.24, 0.22, 0.24, NA),
+  ssb = c(109006, 98611, 95857, 89670)
+)
+
+stfDet <- data.frame(
+  model = "FLR",
+  year = ac(yrAssess:yrTACp1),
+  catch = c(catch(stkProj[,ac(yrAssess:yrTACp1)])),
+  landings = c(landings(stkProj[,ac(yrAssess:yrTACp1)])),
+  fbar = c(fbar(stkProj[,ac(yrAssess:yrTACp1)])),
+  ssb = c(ssb(stkProj[,ac(yrAssess:yrTACp1)]))
+)  
+
+df <- merge(stfRef, stfDet, all = T)
+df <- pivot_longer(df, cols = c(catch, landings, fbar, ssb), 
+  names_to = "variable", values_to = "value")
+df <- df |>
+  filter(
+    (variable %in% c("catch", "landings", "fbar") & year <= yrTAC) |
+    (variable %in% c("ssb") & year <= yrTACp1))
+    
+
+df2 <- pivot_wider(df, names_from = model, values_from = value)
+df2$percErr <- round((df2$FLR - df2$WGBIE)/df2$WGBIE * 100, 1)
+
+ggplot(df) + aes(x = year, y = value, group = model, color = model, shape = model) +
+  facet_wrap(~variable, scales = "free_y") +
+  geom_line() +
+  geom_point(size = 3, stroke = 1) +
+  scale_shape_discrete(solid = F) +
+  coord_cartesian(ylim = c(0, NA)) +
+  theme_bw()
+
+kable(df2, digits = 3)
+
+ggplot(df2) + aes(x = year, y = percErr) + 
+  facet_wrap(~variable) +
+  geom_col(fill = 4) +
+  geom_hline(yintercept = 0, linetype = 1) +
+  geom_hline(yintercept = c(-10,10), linetype = 3) + 
+  theme_bw()
+```
+
+
+WGMIXISH typically uses a threshold of +/-10%.
+
+
+
+
+<!-- # Typical problems -->
+
+<!-- - Forecast slots need additional adjustment to be consistent with the forecast (individual weights, maturity ogive, natural mortality, etc.). State-space models may model future conditions in a more sophisticated way than a simple average of the recent past, such as time-varying processes (e.g. random walk or auto-regressive). These may need to be input manually into the forecast years of the slots.  -->
+<!-- - Note that while time-varying selectivity may be largely reproduced in a deterministic forecast, the inclusion of this process in the subsequent mixed fishery model is currently impossible due to the splitting of catches across fleets and métiers. -->
+
+<!-- An example with haddock (had.27.46a20), where additional input for forecast slots was required ... -->
+
+<!-- First, is a forecast without considering adjustments... -->
+
+<!-- ```{r haddockInit} -->
+<!-- # load haddock -->
+<!-- stkEst <- wgnsskStocks[["HAD"]] -->
+
+<!-- # trim to only historical years -->
+<!-- minyear <- range(stkEst)["minyear"] -->
+<!-- stkEst <- stkEst[,ac(minyear:yrAssess)] -->
+
+<!-- # simple extension of FLStock -->
+<!-- stkProj <- stf(object = stkEst, nyears = 3, wts.nyears = 3,  -->
+<!--   fbar.nyears = 3, f.rescale = TRUE, disc.nyears = 3) -->
+
+<!-- # control -->
+<!-- Fmsy <- 0.174 -->
+<!-- ctrl <- fwdControl(  -->
+<!--   data.frame( -->
+<!--     year = c(yrNow, yrTAC, yrTACp1), -->
+<!--     value = c(1, Fmsy, Fmsy), -->
+<!--     quant = c("f"), -->
+<!--     relYear = c(yrAssess, NA, NA)                                -->
+<!--   ) -->
+<!-- ) -->
+
+<!-- # stock-recruitment model -->
+<!-- srPar <- FLPar(c(1788860, 1788860, 1788860),  -->
+<!--   dimnames = list(params="a", year = c(yrNow, yrTAC, yrTACp1), iter = 1)) -->
+<!-- srMod <- FLSR(model = "geomean", params = srPar) -->
+
+<!-- # projection -->
+<!-- stkProj1 <- fwd(object = stkProj, control = ctrl, sr = srMod) -->
+
+<!-- # plot -->
+<!-- L <- FLStocks(list(assessment = stkEst, forecast = stkProj1[,ac(yrAssess:yrTACp1)])) -->
+<!-- plot(L) +  -->
+<!--   scale_color_manual(values = c(8,1)) +  -->
+<!--   theme_bw() -->
+
+
+<!-- # Reported output from single stock headline advice -->
+<!-- stfRef <- data.frame( -->
+<!--   model = "WGBIE", -->
+<!--   year = 2023:2026, -->
+<!--   catch = c(60979, 66309, 112435, NA), -->
+<!--   landings = c(37702, 53277, 93661, NA), -->
+<!--   fbar = c(0.084, 0.084, 0.174, NA), -->
+<!--   ssb = c(580727, 606378, 535682, 420140) -->
+<!-- ) -->
+
+<!-- stfDet1 <- data.frame( -->
+<!--   model = "FLR", -->
+<!--   year = ac(yrAssess:yrTACp1), -->
+<!--   catch = c(catch(stkProj1[,ac(yrAssess:yrTACp1)])), -->
+<!--   landings = c(landings(stkProj1[,ac(yrAssess:yrTACp1)])), -->
+<!--   fbar = c(fbar(stkProj1[,ac(yrAssess:yrTACp1)])), -->
+<!--   ssb = c(ssb(stkProj1[,ac(yrAssess:yrTACp1)])) -->
+<!-- )   -->
+
+<!-- df1 <- merge(stfRef, stfDet1, all = T) -->
+<!-- df1 <- pivot_longer(df1, cols = c(catch, landings, fbar, ssb),  -->
+<!--   names_to = "variable", values_to = "value") -->
+<!-- df1 <- df1 |> -->
+<!--   filter( -->
+<!--     (variable %in% c("catch", "landings", "fbar") & year <= yrTAC) | -->
+<!--     (variable %in% c("ssb") & year <= yrTACp1)) -->
+<!-- df1 <- pivot_wider(df1, names_from = model, values_from = value) -->
+<!-- df1$percErr <- round((df1$FLR - df1$WGBIE)/df1$WGBIE * 100, 1) -->
+
+<!-- ggplot(df1) + aes(x = year, y = percErr) +  -->
+<!--   facet_wrap(~variable) + -->
+<!--   geom_col(fill = 4) + -->
+<!--   geom_hline(yintercept = 0, linetype = 1) + -->
+<!--   geom_hline(yintercept = c(-10,10), linetype = 3) +  -->
+<!--   theme_bw() -->
+
+<!-- ``` -->
+
+<!-- Then compare to a forecast with further adjustments to individual weights.... -->
+
+<!-- ```{r haddockFix} -->
+<!-- stkProj2 <- stkProj -->
+
+<!-- # replace individual weights -->
+<!-- data("haddockWts") -->
+<!-- catch.wt(stkProj2)[, ac(yrNow:yrTACp1)][] <- t(haddockWts$catch) -->
+<!-- landings.wt(stkProj2)[, ac(yrNow:yrTACp1)][] <- t(haddockWts$landings) -->
+<!-- discards.wt(stkProj2)[, ac(yrNow:yrTACp1)][] <- t(haddockWts$discards) -->
+<!-- stock.wt(stkProj2)[, ac(yrNow:yrTACp1)][] <- t(haddockWts$stock) -->
+
+<!-- stkProj2 <- fwd(object = stkProj2, control = ctrl, sr = srMod) -->
+
+<!-- stfDet2 <- data.frame( -->
+<!--   model = "FLR", -->
+<!--   year = ac(yrAssess:yrTACp1), -->
+<!--   catch = c(catch(stkProj2[,ac(yrAssess:yrTACp1)])), -->
+<!--   landings = c(landings(stkProj2[,ac(yrAssess:yrTACp1)])), -->
+<!--   fbar = c(fbar(stkProj2[,ac(yrAssess:yrTACp1)])), -->
+<!--   ssb = c(ssb(stkProj2[,ac(yrAssess:yrTACp1)])) -->
+<!-- ) -->
+
+<!-- df2 <- merge(stfRef, stfDet2, all = T) -->
+<!-- df2 <- pivot_longer(df2, cols = c(catch, landings, fbar, ssb),  -->
+<!--   names_to = "variable", values_to = "value") -->
+<!-- df2 <- df2 |> -->
+<!--   filter( -->
+<!--     (variable %in% c("catch", "landings", "fbar") & year <= yrTAC) | -->
+<!--     (variable %in% c("ssb") & year <= yrTACp1)) -->
+<!-- df2 <- pivot_wider(df2, names_from = model, values_from = value) -->
+<!-- df2$percErr <- round((df2$FLR - df2$WGBIE)/df2$WGBIE * 100, 1) -->
+<!-- df2$stf <- "adjusted" -->
+
+<!-- df <- df1 -->
+<!-- df$stf <- "original" -->
+<!-- df <- rbind(df, df2) -->
+<!-- df$stf <- factor(df$stf, levels = c("original", "adjusted")) -->
+
+<!-- ggplot(df) + aes(x = year, y = percErr, fill = stf) +  -->
+<!--   facet_wrap(~variable) + -->
+<!--   geom_col(position = position_dodge(), width = 0.75) + -->
+<!--   scale_fill_manual(values = c(4,5)) +  -->
+<!--   geom_hline(yintercept = 0, linetype = 1) + -->
+<!--   geom_hline(yintercept = c(-10,10), linetype = 3) +  -->
+<!--   theme_bw() -->
+
+<!-- ``` -->
+
+<!-- Residual differences are likely attributable to the use of the intermediate year IBTS survey index in the forecast, which influences the starting numbers in 2024. This information is not currently used in the FLR forecast as well as the mixed fishery model.  -->
+
+
+
+# Software Versions
+
+-   `r version$version.string`
+-   FLCore: `r packageVersion('FLCore')`
+-   FLasher: `r packageVersion('FLasher')`
+-   ggplot2: `r packageVersion('ggplot2')`
+-   ggplotFL: `r packageVersion('ggplotFL')`
+-   mixfishtools: `r packageVersion('mixfishtools')`
+-   tidyr: `r packageVersion('tidyr')`
+-   knitr: `r packageVersion('tidyr')`
+-   **Compiled**: `r format(Sys.Date(), '%Y-%b-%d')`
+
+
